@@ -1,0 +1,51 @@
+[package]
+name = "sd2immich"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "sd2immich_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri-plugin-store = "2"
+
+# Local cache/history DB — Rust-owned SQLite pool (reachable from the sync/verify hot path)
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+
+# HTTP client for the Immich API (rustls to avoid a system OpenSSL dependency)
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
+# Checksums for duplicate detection
+sha1 = "0.10"
+hex = "0.4"
+# Filesystem scan + removable-drive detection
+walkdir = "2"
+sysinfo = "0.33"
+# API key storage in the OS keychain
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+# Async runtime + streaming file upload
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures-util = "0.3"
+# ISO-8601 timestamps for asset metadata
+chrono = { version = "0.4", features = ["clock"] }
+# Thumbnail generation: decode/resize standard images, extract RAW embedded previews (pure Rust)
+image = "0.25"
+quickraw = "0.1.6"
+base64 = "0.22"
+

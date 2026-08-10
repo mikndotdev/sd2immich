@@ -135,6 +135,9 @@ export function formatBytes(bytes: number): string {
 
 export type FileKind = "raw" | "image" | "video";
 
+/** Per-tile sync state: still checking, confirmed in Immich, or missing. */
+export type CloudState = "checking" | "in" | "out";
+
 export type CardFile = {
   id: string;
   path: string;

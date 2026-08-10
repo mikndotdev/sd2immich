@@ -122,7 +122,9 @@ pub async fn verify_card(
     let mut items: Vec<Item> = Vec::with_capacity(scan.files.len());
     let mut files_event: Vec<CardFile> = Vec::with_capacity(scan.files.len());
     for f in &scan.files {
+        // Only trust a cached row when the bytes are unchanged (same size + mtime).
         let hit = if config.force { None } else { cache.get(&f.rel_path) };
+        let hit = hit.filter(|h| h.size == f.size && h.mtime == f.mtime);
         let resolved = hit.map(|h| h.confirms_upload(f.size, f.mtime)).unwrap_or(false);
         files_event.push(CardFile {
             id: f.rel_path.clone(),
@@ -169,23 +171,22 @@ pub async fn verify_card(
         });
     }
 
-    // Hash the rest (keyed by rel_path), concurrently. Failures resolve immediately as "missing".
+    // Hash only files that are neither resolved nor already have a reusable cached checksum
+    // (e.g. left by a prior Verify). Failures resolve immediately as "missing".
     let to_hash: Vec<(usize, PathBuf)> = items
         .iter()
         .enumerate()
-        .filter(|(_, it)| !it.resolved)
+        .filter(|(_, it)| !it.resolved && it.checksum.is_none())
         .map(|(i, it)| (i, source.join(&it.rel_path)))
         .collect();
     let results = crate::hash::hash_many(to_hash, crate::hash::hash_concurrency(), |done, total| {
         let _ = on_event.send(VerifyEvent::Progress { phase: "hash".into(), done, total });
     })
     .await;
-    let mut hashed: Vec<usize> = Vec::new();
     for (i, res) in results {
         match res {
             Ok(hex) => {
                 items[i].checksum = Some(hex);
-                hashed.push(i);
             }
             Err(_) => {
                 items[i].status = "error".into();
@@ -200,10 +201,16 @@ pub async fn verify_card(
         }
     }
 
-    // Bulk-check the freshly-hashed files; each result flips its tile.
-    let check_total = hashed.len() as u32;
+    // Bulk-check every unresolved file that has a checksum — freshly hashed OR reused from cache.
+    let to_check: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| !it.resolved && it.checksum.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    let check_total = to_check.len() as u32;
     let mut done = 0u32;
-    for batch in hashed.chunks(CHECK_BATCH) {
+    for batch in to_check.chunks(CHECK_BATCH) {
         let items_req: Vec<CheckItem> = batch
             .iter()
             .map(|&i| CheckItem {

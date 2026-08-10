@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Cloud, CloudOff, Film, Loader2 } from "lucide-react";
+import type { CloudState } from "../lib/immich.ts";
 
-export type CloudState = "checking" | "in" | "out";
+export type { CloudState };
 
 type Loaded = { src: string; badge?: string; isVideo?: boolean };
 

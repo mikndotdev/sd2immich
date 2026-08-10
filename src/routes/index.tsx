@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Link, useNavigate } from "react-router";
 import {
@@ -11,6 +11,7 @@ import {
   Trash2,
   UploadCloud,
 } from "lucide-react";
+import { useJobs } from "../lib/jobs.tsx";
 import {
   cardDisplayName,
   clearCardCache,
@@ -20,7 +21,6 @@ import {
   listRecentCards,
   loadSettings,
   setCardNickname,
-  startSync,
   timeAgo,
   type CardHistory,
   type DriveInfo,
@@ -39,19 +39,15 @@ const PHASE_LABEL: Record<SyncProgress["phase"], string> = {
 };
 
 export default function Home() {
+  const jobs = useJobs();
+  const sync = jobs.sync;
   const [settings, setSettings] = useState<Settings | null>(null);
   const [configured, setConfigured] = useState(false);
   const [drives, setDrives] = useState<DriveInfo[]>([]);
-  const [syncing, setSyncing] = useState(false);
-  const [progress, setProgress] = useState<SyncProgress | null>(null);
-  const [summary, setSummary] = useState<Summary | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [source, setSource] = useState<string | null>(null);
   const [force, setForce] = useState(false);
   const [recent, setRecent] = useState<CardHistory[]>([]);
   const [editingCard, setEditingCard] = useState<string | null>(null);
   const [cardNameDraft, setCardNameDraft] = useState("");
-  const syncingRef = useRef(false);
   const navigate = useNavigate();
 
   const refreshRecent = useCallback(() => {
@@ -90,36 +86,18 @@ export default function Home() {
 
   const runSync = useCallback(
     async (sourcePath: string) => {
-      if (syncingRef.current || !settings) return;
-      syncingRef.current = true;
-      setSyncing(true);
-      setSummary(null);
-      setError(null);
-      setProgress(null);
-      setSource(sourcePath);
-      try {
-        const result = await startSync(
-          {
-            serverUrl: settings.serverUrl,
-            deviceId: settings.deviceId,
-            uploadFilter: settings.uploadFilter,
-            stackMode: settings.stackMode,
-            sourcePath,
-            force,
-          },
-          setProgress,
-        );
-        setSummary(result);
-      } catch (e) {
-        setError(String(e));
-      } finally {
-        syncingRef.current = false;
-        setSyncing(false);
-        setProgress(null);
-        refreshRecent();
-      }
+      if (!settings || jobs.busy) return;
+      await jobs.startSync({
+        serverUrl: settings.serverUrl,
+        deviceId: settings.deviceId,
+        uploadFilter: settings.uploadFilter,
+        stackMode: settings.stackMode,
+        sourcePath,
+        force,
+      });
+      refreshRecent();
     },
-    [settings, force, refreshRecent],
+    [settings, force, jobs, refreshRecent],
   );
 
   async function pickFolder() {
@@ -158,7 +136,7 @@ export default function Home() {
         <div className="card-body gap-3">
           <div className="flex items-center justify-between">
             <h2 className="card-title text-base">Detected cards</h2>
-            <button className="btn btn-ghost btn-xs" onClick={refreshDrives} disabled={syncing}>
+            <button className="btn btn-ghost btn-xs" onClick={refreshDrives} disabled={jobs.busy}>
               <RefreshCw size={14} /> Refresh
             </button>
           </div>
@@ -187,14 +165,14 @@ export default function Home() {
                   <div className="flex shrink-0 gap-1">
                     <button
                       className="btn btn-ghost btn-sm"
-                      disabled={syncing}
+                      disabled={jobs.busy}
                       onClick={() => navigate("/gallery", { state: { source: d.mountPoint } })}
                     >
                       Verify
                     </button>
                     <button
                       className="btn btn-primary btn-sm"
-                      disabled={syncing}
+                      disabled={jobs.busy}
                       onClick={() => runSync(d.mountPoint)}
                     >
                       Sync
@@ -206,7 +184,7 @@ export default function Home() {
           )}
 
           <div className="flex items-center justify-between">
-            <button className="btn btn-outline btn-sm" onClick={pickFolder} disabled={syncing}>
+            <button className="btn btn-outline btn-sm" onClick={pickFolder} disabled={jobs.busy}>
               <FolderOpen size={16} /> Choose folder…
             </button>
             <label className="label cursor-pointer gap-2 text-xs">
@@ -214,7 +192,7 @@ export default function Home() {
                 type="checkbox"
                 className="checkbox checkbox-xs"
                 checked={force}
-                disabled={syncing}
+                disabled={jobs.busy}
                 onChange={(e) => setForce(e.target.checked)}
               />
               Re-check everything
@@ -223,45 +201,47 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Progress */}
-      {syncing && (
+      {/* Progress (persists across tab changes via the jobs context) */}
+      {sync.running && (
         <div className="card bg-base-200 mb-4">
           <div className="card-body gap-2">
             <div className="flex items-center justify-between text-sm">
               <span className="font-medium">
-                {progress ? PHASE_LABEL[progress.phase] : "Starting…"}
+                {sync.progress ? PHASE_LABEL[sync.progress.phase] : "Starting…"}
               </span>
-              {progress && progress.total > 0 && (
+              {sync.progress && sync.progress.total > 0 && (
                 <span className="opacity-60">
-                  {progress.done} / {progress.total}
+                  {sync.progress.done} / {sync.progress.total}
                 </span>
               )}
             </div>
-            {progress && progress.total > 0 ? (
+            {sync.progress && sync.progress.total > 0 ? (
               <progress
                 className="progress progress-primary w-full"
-                value={progress.done}
-                max={progress.total}
+                value={sync.progress.done}
+                max={sync.progress.total}
               />
             ) : (
               <progress className="progress progress-primary w-full" />
             )}
-            {progress?.current && <div className="text-xs opacity-60 truncate">{progress.current}</div>}
-            {source && <div className="text-xs opacity-50 truncate">from {source}</div>}
+            {sync.progress?.current && (
+              <div className="text-xs opacity-60 truncate">{sync.progress.current}</div>
+            )}
+            {sync.source && <div className="text-xs opacity-50 truncate">from {sync.source}</div>}
           </div>
         </div>
       )}
 
       {/* Error */}
-      {error && (
+      {sync.error && (
         <div className="alert alert-error mb-4">
           <AlertTriangle size={18} />
-          <span className="text-sm break-all">{error}</span>
+          <span className="text-sm break-all">{sync.error}</span>
         </div>
       )}
 
       {/* Summary */}
-      {summary && !syncing && <SummaryCard summary={summary} />}
+      {sync.summary && !sync.running && <SummaryCard summary={sync.summary} />}
 
       {/* Recent cards */}
       {recent.length > 0 && (
@@ -315,7 +295,7 @@ export default function Home() {
                       {mounted && (
                         <button
                           className="btn btn-ghost btn-sm"
-                          disabled={syncing}
+                          disabled={jobs.busy}
                           onClick={() =>
                             navigate("/gallery", { state: { source: mounted.mountPoint } })
                           }
@@ -326,7 +306,7 @@ export default function Home() {
                       <button
                         className="btn btn-ghost btn-sm"
                         title="Clear this card's cache"
-                        disabled={syncing}
+                        disabled={jobs.busy}
                         onClick={async () => {
                           await clearCardCache(c.cardId);
                           refreshRecent();

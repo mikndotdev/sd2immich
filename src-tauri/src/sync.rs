@@ -191,7 +191,10 @@ pub async fn start_sync(
                 resolved: false,
                 error: None,
             };
-            // Cache fast-path: unchanged + previously confirmed ⇒ skip all work.
+            // Cache fast-path. Two tiers, both keyed on unchanged (size, mtime):
+            //   1. previously confirmed on the server ⇒ skip hash + check + upload.
+            //   2. otherwise, if a checksum is already cached (e.g. from a prior Verify) ⇒ reuse
+            //      it to skip hashing, but still bulk-check + upload.
             if let Some(hit) = cache.get(&c.rel_path) {
                 if hit.confirms_upload(c.size, c.mtime) {
                     c.checksum = hit.checksum.clone();
@@ -200,17 +203,20 @@ pub async fn start_sync(
                     c.stacked = hit.stacked;
                     c.resolved = true;
                     summary.skipped_cached += 1;
+                } else if hit.size == c.size && hit.mtime == c.mtime {
+                    c.checksum = hit.checksum.clone();
+                    c.stacked = hit.stacked;
                 }
             }
             c
         })
         .collect();
 
-    // ---- Hash (only unresolved), concurrently ----
+    // ---- Hash (only files not resolved and without a reusable cached checksum) ----
     let to_hash: Vec<(usize, PathBuf)> = candidates
         .iter()
         .enumerate()
-        .filter(|(_, c)| !c.resolved)
+        .filter(|(_, c)| !c.resolved && c.checksum.is_none())
         .map(|(i, c)| (i, c.path.clone()))
         .collect();
     let results = crate::hash::hash_many(to_hash, crate::hash::hash_concurrency(), |done, total| {

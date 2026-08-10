@@ -6,6 +6,9 @@ import { load, type Store } from "@tauri-apps/plugin-store";
 
 export type UserInfo = { email: string; name: string };
 
+export type PermCheck = { name: string; ok: boolean };
+export type TestResult = { email: string; name: string; permissions: PermCheck[] };
+
 export type DriveInfo = {
   name: string;
   mountPoint: string;
@@ -18,7 +21,10 @@ export type UploadFilter = "raw" | "image" | "both";
 export type StackMode = "off" | "jpeg-cover" | "raw-cover";
 
 export type Settings = {
+  /** the active instance's base URL */
   serverUrl: string;
+  /** all known Immich instance base URLs */
+  instances: string[];
   deviceId: string;
   uploadFilter: UploadFilter;
   stackMode: StackMode;
@@ -56,7 +62,13 @@ async function store(): Promise<Store> {
 
 export async function loadSettings(): Promise<Settings> {
   const s = await store();
-  const serverUrl = (await s.get<string>("serverUrl")) ?? "";
+  const savedUrl = (await s.get<string>("serverUrl")) ?? "";
+  let instances = (await s.get<string[]>("instances")) ?? [];
+  // Migrate a single legacy serverUrl into the instances list.
+  if (instances.length === 0 && savedUrl) instances = [savedUrl];
+  // The active instance must be one we know about.
+  const serverUrl = savedUrl && instances.includes(savedUrl) ? savedUrl : (instances[0] ?? "");
+
   let deviceId = (await s.get<string>("deviceId")) ?? "";
   if (!deviceId) {
     deviceId = crypto.randomUUID();
@@ -65,7 +77,7 @@ export async function loadSettings(): Promise<Settings> {
   }
   const uploadFilter = ((await s.get<string>("uploadFilter")) as UploadFilter) ?? "both";
   const stackMode = ((await s.get<string>("stackMode")) as StackMode) ?? "off";
-  return { serverUrl, deviceId, uploadFilter, stackMode };
+  return { serverUrl, instances, deviceId, uploadFilter, stackMode };
 }
 
 export async function saveSettings(partial: Partial<Settings>): Promise<void> {
@@ -79,7 +91,7 @@ export async function saveSettings(partial: Partial<Settings>): Promise<void> {
 // ---- Commands ----
 
 export const testConnection = (serverUrl: string, apiKey: string) =>
-  invoke<UserInfo>("test_connection", { serverUrl, apiKey });
+  invoke<TestResult>("test_connection", { serverUrl, apiKey });
 
 export const setApiKey = (serverUrl: string, apiKey: string) =>
   invoke<void>("set_api_key", { serverUrl, apiKey });
@@ -145,6 +157,7 @@ export type VerifySummary = {
 export type CardHistory = {
   cardId: string;
   label: string;
+  nickname: string | null;
   mountPoint: string | null;
   totalBytes: number | null;
   lastSynced: number | null;
@@ -152,6 +165,17 @@ export type CardHistory = {
   uploaded: number;
   inImmich: number;
 };
+
+export type CardRef = {
+  cardId: string;
+  label: string;
+  nickname: string | null;
+};
+
+/** The name to show for a card: its nickname if set, else the volume label. */
+export function cardDisplayName(c: { nickname: string | null; label: string }): string {
+  return c.nickname && c.nickname.trim() ? c.nickname : c.label;
+}
 
 export type TileMeta = { thumb: string; name: string; isRaw: boolean; isVideo: boolean };
 
@@ -199,8 +223,11 @@ export const listRecentCards = () => invoke<CardHistory[]>("list_recent_cards");
 export const clearCardCache = (cardId: string) =>
   invoke<void>("clear_card_cache", { cardId });
 
-export const cardIdFor = (sourcePath: string) =>
-  invoke<string>("card_id_for", { sourcePath });
+export const resolveCard = (sourcePath: string) =>
+  invoke<CardRef>("resolve_card", { sourcePath });
+
+export const setCardNickname = (cardId: string, nickname: string | null) =>
+  invoke<void>("set_card_nickname", { cardId, nickname });
 
 /** Relative "time ago" for a unix-seconds timestamp. */
 export function timeAgo(unixSecs: number | null): string {

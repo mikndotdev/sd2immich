@@ -12,7 +12,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use tauri::Manager;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Cached per-file state, enough to decide whether work can be skipped.
 #[derive(Clone, Debug)]
@@ -64,6 +64,7 @@ pub struct CardId {
 pub struct CardHistory {
     pub card_id: String,
     pub label: String,
+    pub nickname: Option<String>,
     pub mount_point: Option<String>,
     pub total_bytes: Option<i64>,
     pub last_synced: Option<i64>,
@@ -72,20 +73,35 @@ pub struct CardHistory {
     pub in_immich: i64,
 }
 
+/// Identity + display info for one source, resolved on demand for the UI.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardRef {
+    pub card_id: String,
+    pub label: String,
+    pub nickname: Option<String>,
+}
+
 fn sha1_hex(s: &str) -> String {
     let mut h = Sha1::new();
     h.update(s.as_bytes());
     hex::encode(h.finalize())
 }
 
-/// Derive a card identity from a source path: match against a mounted removable drive when
-/// possible (id = sha1(label:capacity)), else treat it as a plain folder (id = sha1(abs path)).
+/// Derive a card identity from a source path. When the source is on a mounted removable drive we
+/// prefer the volume serial/UUID (unique per card even when all are labelled "Untitled"), falling
+/// back to a label+capacity heuristic, then to the folder path. Correctness never depends on this
+/// being unique — the server is the dedup authority — so a collision only costs some efficiency.
 pub fn card_identity(source: &Path) -> CardId {
     let source_str = source.to_string_lossy().to_string();
     for d in crate::drives::list_removable_drives() {
         if !d.mount_point.is_empty() && source_str.starts_with(&d.mount_point) {
+            let id = match crate::drives::volume_serial(&d.mount_point) {
+                Some(serial) => sha1_hex(&format!("vol:{serial}")),
+                None => sha1_hex(&format!("{}:{}", d.name, d.total_bytes)),
+            };
             return CardId {
-                id: sha1_hex(&format!("{}:{}", d.name, d.total_bytes)),
+                id,
                 label: if d.name.is_empty() { d.mount_point.clone() } else { d.name.clone() },
                 mount_point: d.mount_point,
                 total_bytes: d.total_bytes as i64,
@@ -134,7 +150,8 @@ async fn migrate(pool: &SqlitePool) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     if version < 1 {
-        sqlx::query(
+        // `raw_sql` runs every statement — `query().execute()` would run only the first on SQLite.
+        sqlx::raw_sql(
             r#"
             CREATE TABLE IF NOT EXISTS cards (
               card_id     TEXT PRIMARY KEY,
@@ -167,6 +184,25 @@ async fn migrate(pool: &SqlitePool) -> Result<(), String> {
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
+    }
+
+    if version < 2 {
+        // Card identity now keys on the volume UUID, so pre-v2 rows are unreachable — clear them.
+        // Also add the nickname column (ignore error if a fresh DB somehow already has it).
+        let _ = sqlx::query("ALTER TABLE cards ADD COLUMN nickname TEXT")
+            .execute(pool)
+            .await;
+        sqlx::query("DELETE FROM files")
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        sqlx::query("DELETE FROM cards")
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    if version < SCHEMA_VERSION {
         // PRAGMA can't be bound; SCHEMA_VERSION is a trusted constant.
         sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
             .execute(pool)
@@ -282,7 +318,7 @@ pub async fn upsert_files(pool: &SqlitePool, card_id: &str, rows: &[FileRow]) ->
 pub async fn list_recent_cards(pool: &SqlitePool) -> Result<Vec<CardHistory>, String> {
     let rows = sqlx::query(
         r#"
-        SELECT c.card_id, c.label, c.mount_point, c.total_bytes, c.last_synced,
+        SELECT c.card_id, c.label, c.nickname, c.mount_point, c.total_bytes, c.last_synced,
                COUNT(f.rel_path) AS files,
                COALESCE(SUM(CASE WHEN f.status = 'uploaded' THEN 1 ELSE 0 END), 0) AS uploaded,
                COALESCE(SUM(CASE WHEN f.status IN ('uploaded','duplicate') THEN 1 ELSE 0 END), 0) AS in_immich
@@ -302,6 +338,7 @@ pub async fn list_recent_cards(pool: &SqlitePool) -> Result<Vec<CardHistory>, St
         .map(|r| CardHistory {
             card_id: r.get("card_id"),
             label: r.get("label"),
+            nickname: r.get("nickname"),
             mount_point: r.get("mount_point"),
             total_bytes: r.get("total_bytes"),
             last_synced: r.get("last_synced"),
@@ -315,6 +352,34 @@ pub async fn list_recent_cards(pool: &SqlitePool) -> Result<Vec<CardHistory>, St
 /// Forget everything cached for a card (leaves the card row so history still lists it).
 pub async fn clear_card(pool: &SqlitePool, card_id: &str) -> Result<(), String> {
     sqlx::query("DELETE FROM files WHERE card_id = ?1")
+        .bind(card_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Resolve a source's identity plus its saved nickname (for the gallery header / clear-cache).
+pub async fn resolve_card(pool: &SqlitePool, source: &Path) -> CardRef {
+    let card = card_identity(source);
+    let nickname = sqlx::query("SELECT nickname FROM cards WHERE card_id = ?1")
+        .bind(&card.id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.get::<Option<String>, _>("nickname"));
+    CardRef {
+        card_id: card.id,
+        label: card.label,
+        nickname,
+    }
+}
+
+/// Set (or clear, when `None`) a card's nickname.
+pub async fn set_nickname(pool: &SqlitePool, card_id: &str, nickname: Option<String>) -> Result<(), String> {
+    sqlx::query("UPDATE cards SET nickname = ?1 WHERE card_id = ?2")
+        .bind(nickname)
         .bind(card_id)
         .execute(pool)
         .await

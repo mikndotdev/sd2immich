@@ -1,14 +1,25 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Link, useNavigate } from "react-router";
-import { AlertTriangle, FolderOpen, HardDrive, History, RefreshCw, Trash2, UploadCloud } from "lucide-react";
 import {
+  AlertTriangle,
+  FolderOpen,
+  HardDrive,
+  History,
+  Pencil,
+  RefreshCw,
+  Trash2,
+  UploadCloud,
+} from "lucide-react";
+import {
+  cardDisplayName,
   clearCardCache,
   formatBytes,
   hasApiKey,
   listDrives,
   listRecentCards,
   loadSettings,
+  setCardNickname,
   startSync,
   timeAgo,
   type CardHistory,
@@ -38,6 +49,8 @@ export default function Home() {
   const [source, setSource] = useState<string | null>(null);
   const [force, setForce] = useState(false);
   const [recent, setRecent] = useState<CardHistory[]>([]);
+  const [editingCard, setEditingCard] = useState<string | null>(null);
+  const [cardNameDraft, setCardNameDraft] = useState("");
   const syncingRef = useRef(false);
   const navigate = useNavigate();
 
@@ -112,6 +125,13 @@ export default function Home() {
   async function pickFolder() {
     const dir = await open({ directory: true, multiple: false, title: "Choose SD card or folder" });
     if (typeof dir === "string") runSync(dir);
+  }
+
+  async function saveCardName(cardId: string) {
+    setEditingCard(null);
+    const name = cardNameDraft.trim();
+    await setCardNickname(cardId, name || null);
+    refreshRecent();
   }
 
   if (settings && !configured) {
@@ -259,7 +279,33 @@ export default function Home() {
                     className="flex items-center justify-between rounded-lg bg-base-100 p-3"
                   >
                     <div className="min-w-0">
-                      <div className="truncate font-medium">{c.label}</div>
+                      {editingCard === c.cardId ? (
+                        <input
+                          autoFocus
+                          className="input input-xs input-bordered w-44"
+                          value={cardNameDraft}
+                          onChange={(e) => setCardNameDraft(e.target.value)}
+                          onBlur={() => saveCardName(c.cardId)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") e.currentTarget.blur();
+                            if (e.key === "Escape") setEditingCard(null);
+                          }}
+                        />
+                      ) : (
+                        <div className="flex items-center gap-1">
+                          <span className="truncate font-medium">{cardDisplayName(c)}</span>
+                          <button
+                            className="btn btn-ghost btn-xs px-1"
+                            title="Rename card"
+                            onClick={() => {
+                              setCardNameDraft(c.nickname ?? "");
+                              setEditingCard(c.cardId);
+                            }}
+                          >
+                            <Pencil size={12} />
+                          </button>
+                        </div>
+                      )}
                       <div className="text-xs opacity-60 truncate">
                         {c.inImmich}/{c.files} in Immich · synced {timeAgo(c.lastSynced)}
                         {mounted ? " · inserted" : ""}

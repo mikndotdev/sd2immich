@@ -6,6 +6,7 @@ import {
   FolderOpen,
   HardDrive,
   Loader2,
+  Pencil,
   RefreshCw,
   Trash2,
   UploadCloud,
@@ -13,7 +14,7 @@ import {
 import { PhotoTile, type CloudState } from "../components/tile.tsx";
 import {
   badgeFor,
-  cardIdFor,
+  cardDisplayName,
   clearCardCache,
   hasApiKey,
   immichTile,
@@ -22,9 +23,12 @@ import {
   listDrives,
   loadSettings,
   localThumbnail,
+  resolveCard,
+  setCardNickname,
   startSync,
   verifyCard,
   type CardFile,
+  type CardRef,
   type DriveInfo,
   type Settings,
   type TimeBucket,
@@ -232,7 +236,25 @@ function CardView({
   const [clearing, setClearing] = useState(false);
   const [sortOrder, setSortOrder] = useState<SortOrder>("newest");
   const [syncFilter, setSyncFilter] = useState<SyncFilter>("all");
+  const [cardRef, setCardRef] = useState<CardRef | null>(null);
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState("");
   const verifyingRef = useRef(false);
+
+  // Resolve the card's identity + saved nickname whenever the source changes.
+  useEffect(() => {
+    setEditingName(false);
+    if (source) resolveCard(source).then(setCardRef).catch(() => setCardRef(null));
+    else setCardRef(null);
+  }, [source]);
+
+  async function saveName() {
+    setEditingName(false);
+    if (!cardRef) return;
+    const name = nameDraft.trim();
+    await setCardNickname(cardRef.cardId, name || null);
+    setCardRef({ ...cardRef, nickname: name || null });
+  }
   const forceRef = useRef(false);
   const setForce = (v: boolean) => {
     forceRef.current = v;
@@ -331,8 +353,8 @@ function CardView({
     if (!source) return;
     setClearing(true);
     try {
-      const id = await cardIdFor(source);
-      await clearCardCache(id);
+      const ref = cardRef ?? (await resolveCard(source));
+      await clearCardCache(ref.cardId);
       await verify(source);
     } catch (e) {
       setError(String(e));
@@ -398,12 +420,43 @@ function CardView({
   return (
     <>
       <div className="mb-3 flex flex-wrap items-center gap-3">
-        <div className="text-sm">
-          <span className="font-medium truncate">{source}</span>
-          <span className="opacity-60">
-            {" "}
-            · {files.length} files · {inImmich} in Immich · {missing} to upload
-          </span>
+        <div className="text-sm min-w-0">
+          <div className="flex items-center gap-1">
+            {editingName ? (
+              <input
+                autoFocus
+                className="input input-xs input-bordered"
+                value={nameDraft}
+                onChange={(e) => setNameDraft(e.target.value)}
+                onBlur={saveName}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") e.currentTarget.blur();
+                  if (e.key === "Escape") setEditingName(false);
+                }}
+              />
+            ) : (
+              <>
+                <span className="font-medium truncate">
+                  {cardRef ? cardDisplayName(cardRef) : source}
+                </span>
+                {cardRef && (
+                  <button
+                    className="btn btn-ghost btn-xs px-1"
+                    title="Rename card"
+                    onClick={() => {
+                      setNameDraft(cardRef.nickname ?? "");
+                      setEditingName(true);
+                    }}
+                  >
+                    <Pencil size={12} />
+                  </button>
+                )}
+              </>
+            )}
+          </div>
+          <div className="text-xs opacity-60 truncate">
+            {files.length} files · {inImmich} in Immich · {missing} to upload
+          </div>
         </div>
         <div className="ml-auto flex items-center gap-2">
           <label className="label cursor-pointer gap-1 text-xs">

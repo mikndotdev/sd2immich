@@ -27,6 +27,23 @@ pub struct UserInfo {
     pub name: String,
 }
 
+/// One probed capability from a connection test.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermCheck {
+    pub name: String,
+    pub ok: bool,
+}
+
+/// Result of a connection test: the owning user + per-capability probe outcomes.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestResult {
+    pub email: String,
+    pub name: String,
+    pub permissions: Vec<PermCheck>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct MediaTypes {
     #[serde(default)]

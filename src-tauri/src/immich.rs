@@ -21,6 +21,9 @@ pub struct ImmichClient {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UserInfo {
+    /// Immich user id (UUID) — stable per account+server, our "same library" key.
+    #[serde(default)]
+    pub id: String,
     #[serde(default)]
     pub email: String,
     #[serde(default)]

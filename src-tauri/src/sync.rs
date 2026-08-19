@@ -16,8 +16,9 @@ use sqlx::SqlitePool;
 use tauri::ipc::Channel;
 use tauri::State;
 
+use crate::cardfile;
 use crate::classify::{Classifier, Kind, UploadFilter};
-use crate::db::{self, FileRow};
+use crate::db::{self, CachedFile, FileRow};
 use crate::immich::{CheckItem, ImmichClient};
 use crate::keychain;
 
@@ -36,6 +37,9 @@ pub struct SyncConfig {
     /// Bypass the local cache and re-hash/re-check everything.
     #[serde(default)]
     pub force: bool,
+    /// Write the `sd2i.data` sidecar to the card (consent resolved on the frontend).
+    #[serde(default)]
+    pub write_sidecar: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -53,6 +57,9 @@ pub enum SyncEvent {
         total: u32,
         current: Option<String>,
     },
+    /// A file's in-Immich state resolved (uploaded / already present) — lets the gallery grid
+    /// flip that tile's cloud icon live and decrement the "to upload" counter.
+    File { id: String, in_immich: bool },
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -113,6 +120,13 @@ fn emit(ch: &Channel<SyncEvent>, phase: &str, done: u32, total: u32, current: Op
     });
 }
 
+fn emit_file(ch: &Channel<SyncEvent>, id: &str, in_immich: bool) {
+    let _ = ch.send(SyncEvent::File {
+        id: id.to_string(),
+        in_immich,
+    });
+}
+
 /// Format a filesystem time as RFC-3339; fall back to "now" if unavailable.
 fn fmt_time(t: Option<SystemTime>) -> String {
     match t {
@@ -150,19 +164,50 @@ pub async fn start_sync(
         .ok_or_else(|| "No API key saved for this server — set it in Settings".to_string())?;
     let client = ImmichClient::new(&config.server_url, &api_key)?;
 
+    // Identify the library (Immich user id) — the "same server" key for portable card data.
+    let instance_id = client.me().await?.id;
+
     // Accepted-extension lists drive classification.
     let media = client.media_types().await?;
     let classifier = Classifier::new(&media.image, &media.video);
 
     let mut summary = Summary::default();
 
-    // Card identity + cache.
-    let card = db::card_identity(&source);
-    db::touch_card(pool, &card).await?;
-    let cache = if config.force {
+    // Card identity: sidecar UUID when present, else a provisional volume-heuristic id.
+    let card_base = db::card_identity(&source);
+    let card_data = cardfile::read(&source);
+    let card_id = card_data
+        .as_ref()
+        .map(|d| d.card_id.clone())
+        .unwrap_or_else(|| card_base.id.clone());
+    let writable = cardfile::is_writable(&source);
+    db::touch_card(
+        pool,
+        &db::CardId {
+            id: card_id.clone(),
+            label: card_base.label.clone(),
+            mount_point: card_base.mount_point.clone(),
+            total_bytes: card_base.total_bytes,
+        },
+    )
+    .await?;
+    // Adopt the sidecar's name (portable truth) into the local nickname.
+    if let Some(name) = card_data.as_ref().and_then(|d| d.name.clone()) {
+        let _ = db::set_nickname(pool, &card_id, Some(name)).await;
+    }
+
+    // Seed the cache: the sidecar's entry for this library carries state across machines; else DB.
+    let cache: HashMap<String, CachedFile> = if config.force {
         HashMap::new()
+    } else if let Some(inst) = card_data.as_ref().and_then(|d| d.instances.get(&instance_id)) {
+        let rows: Vec<FileRow> = inst.files.iter().map(|f| f.to_row()).collect();
+        let _ = db::upsert_files(pool, &card_id, &rows).await;
+        inst.files
+            .iter()
+            .map(|f| (f.rel_path.clone(), f.to_cached()))
+            .collect()
     } else {
-        db::load_card_cache(pool, &card.id).await.unwrap_or_default()
+        db::load_card_cache(pool, &card_id).await.unwrap_or_default()
     };
 
     // ---- Scan + classify/filter (shared with verify) ----
@@ -211,6 +256,13 @@ pub async fn start_sync(
             c
         })
         .collect();
+
+    // Cached-confirmed files are already in Immich — reflect them on the grid immediately.
+    for c in &candidates {
+        if c.resolved {
+            emit_file(&on_event, &c.rel_path, true);
+        }
+    }
 
     // ---- Hash (only files not resolved and without a reusable cached checksum) ----
     let to_hash: Vec<(usize, PathBuf)> = candidates
@@ -263,6 +315,8 @@ pub async fn start_sync(
                         candidates[idx].immich_id = r.asset_id;
                         candidates[idx].status = "duplicate".into();
                         summary.already_in_immich += 1;
+                        let rel = candidates[idx].rel_path.clone();
+                        emit_file(&on_event, &rel, true);
                     } else {
                         candidates[idx].status = "error".into();
                         let reason = r.reason.unwrap_or_else(|| "unknown".into());
@@ -311,6 +365,7 @@ pub async fn start_sync(
                     candidates[i].status = "duplicate".into();
                     summary.already_in_immich += 1;
                 }
+                emit_file(&on_event, &rel, true);
             }
             Err(e) => {
                 candidates[i].status = "error".into();
@@ -389,8 +444,35 @@ pub async fn start_sync(
             error: c.error.clone(),
         })
         .collect();
-    if let Err(e) = db::upsert_files(pool, &card.id, &rows).await {
+    if let Err(e) = db::upsert_files(pool, &card_id, &rows).await {
         summary.error_messages.push(format!("cache write: {e}"));
+    }
+
+    // ---- Write the on-card sidecar (consented + writable card) ----
+    if config.write_sidecar && writable {
+        // First write on a card with no sidecar: mint a UUID and migrate legacy rows into it.
+        let final_id = match card_data.as_ref() {
+            Some(d) => d.card_id.clone(),
+            None => {
+                let uuid = cardfile::new_card_id();
+                let _ = db::rekey_card(pool, &card_id, &uuid).await;
+                uuid
+            }
+        };
+        let mut data = card_data.unwrap_or_else(|| cardfile::CardData::new(final_id.clone()));
+        data.card_id = final_id.clone();
+        data.name = db::get_nickname(pool, &final_id).await.or(data.name);
+        data.instances.insert(
+            instance_id.clone(),
+            cardfile::InstanceData {
+                server_url: Some(config.server_url.clone()),
+                last_synced: cardfile::now_secs(),
+                files: rows.iter().map(cardfile::FileRecord::from_row).collect(),
+            },
+        );
+        if let Err(e) = cardfile::write(&source, &data) {
+            summary.error_messages.push(format!("card file: {e}"));
+        }
     }
 
     emit(&on_event, "done", 0, 0, None);

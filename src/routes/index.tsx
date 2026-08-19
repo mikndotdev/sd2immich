@@ -3,6 +3,8 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { Link, useNavigate } from "react-router";
 import {
   AlertTriangle,
+  Check,
+  FilePlus2,
   FolderOpen,
   HardDrive,
   History,
@@ -20,11 +22,15 @@ import {
   listDrives,
   listRecentCards,
   loadSettings,
+  saveSettings,
   setCardNickname,
+  sidecarStatus,
   timeAgo,
+  writeSidecarFile,
   type CardHistory,
   type DriveInfo,
   type Settings,
+  type SidecarStatus,
   type Summary,
   type SyncProgress,
 } from "../lib/immich";
@@ -48,6 +54,8 @@ export default function Home() {
   const [recent, setRecent] = useState<CardHistory[]>([]);
   const [editingCard, setEditingCard] = useState<string | null>(null);
   const [cardNameDraft, setCardNameDraft] = useState("");
+  const [sidecarMap, setSidecarMap] = useState<Record<string, SidecarStatus>>({});
+  const [sidecarError, setSidecarError] = useState<string | null>(null);
   const navigate = useNavigate();
 
   const refreshRecent = useCallback(() => {
@@ -58,6 +66,18 @@ export default function Home() {
   useEffect(() => {
     refreshRecent();
   }, [refreshRecent]);
+
+  // Fetch sidecar status for recent cards that are currently inserted.
+  useEffect(() => {
+    for (const c of recent) {
+      const mounted = drives.find((d) => d.mountPoint === c.mountPoint);
+      if (mounted) {
+        sidecarStatus(mounted.mountPoint)
+          .then((st) => setSidecarMap((m) => ({ ...m, [c.cardId]: st })))
+          .catch(() => {});
+      }
+    }
+  }, [recent, drives]);
 
   useEffect(() => {
     loadSettings().then(async (s) => {
@@ -110,6 +130,24 @@ export default function Home() {
     const name = cardNameDraft.trim();
     await setCardNickname(cardId, name || null);
     refreshRecent();
+  }
+
+  async function addSidecar(mountPoint: string, provisionalId: string) {
+    if (!settings) return;
+    setSidecarError(null);
+    try {
+      await writeSidecarFile(mountPoint, settings.serverUrl);
+      // If the card was previously declined, clear it so future syncs write silently.
+      const s = await loadSettings();
+      if (s.sidecarDeclined.includes(provisionalId)) {
+        await saveSettings({
+          sidecarDeclined: s.sidecarDeclined.filter((x) => x !== provisionalId),
+        });
+      }
+      refreshRecent();
+    } catch (e) {
+      setSidecarError(String(e));
+    }
   }
 
   if (settings && !configured) {
@@ -250,6 +288,12 @@ export default function Home() {
             <h2 className="card-title text-base flex items-center gap-2">
               <History size={16} /> Recent cards
             </h2>
+            {sidecarError && (
+              <div className="alert alert-error text-sm">
+                <AlertTriangle size={16} />
+                <span className="break-all">{sidecarError}</span>
+              </div>
+            )}
             <ul className="flex flex-col gap-2">
               {recent.map((c) => {
                 const mounted = drives.find((d) => d.mountPoint === c.mountPoint);
@@ -292,6 +336,14 @@ export default function Home() {
                       </div>
                     </div>
                     <div className="flex shrink-0 items-center gap-1">
+                      {mounted && sidecarMap[c.cardId] && (
+                        <SidecarBadge
+                          status={sidecarMap[c.cardId]}
+                          onWrite={() =>
+                            addSidecar(mounted.mountPoint, sidecarMap[c.cardId].provisionalId)
+                          }
+                        />
+                      )}
                       {mounted && (
                         <button
                           className="btn btn-ghost btn-sm"
@@ -323,6 +375,43 @@ export default function Home() {
         </div>
       )}
     </div>
+  );
+}
+
+function SidecarBadge({ status, onWrite }: { status: SidecarStatus; onWrite: () => void }) {
+  if (status.hasSidecar) {
+    return (
+      <span className="badge badge-success badge-sm gap-1" title="Sync file is on this card">
+        <Check size={12} /> on card
+      </span>
+    );
+  }
+  if (status.fileExists) {
+    return (
+      <button
+        className="badge badge-warning badge-sm gap-1"
+        title="Sync file is corrupt — rewrite it"
+        onClick={onWrite}
+      >
+        <AlertTriangle size={12} /> repair
+      </button>
+    );
+  }
+  if (status.writable) {
+    return (
+      <button
+        className="badge badge-ghost badge-sm gap-1"
+        title="Add the sync file to this card"
+        onClick={onWrite}
+      >
+        <FilePlus2 size={12} /> add file
+      </button>
+    );
+  }
+  return (
+    <span className="badge badge-ghost badge-sm opacity-60" title="Card is read-only">
+      read-only
+    </span>
   );
 }
 

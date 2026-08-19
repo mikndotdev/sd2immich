@@ -38,7 +38,7 @@ pub fn scan_source(source: &Path, classifier: &Classifier, filter: UploadFilter)
         }
         let path = entry.path();
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with("._") || name == ".DS_Store" {
+            if name.starts_with("._") || name == ".DS_Store" || name == "sd2i.data" {
                 continue;
             }
         }

@@ -30,6 +30,7 @@ export default function SettingsPage() {
   const [keyed, setKeyed] = useState<Record<string, boolean>>({});
   const [uploadFilter, setUploadFilter] = useState<UploadFilter>("both");
   const [stackMode, setStackMode] = useState<StackMode>("off");
+  const [writeSidecar, setWriteSidecar] = useState(true);
 
   // Add/Edit-server modal.
   const modalRef = useRef<HTMLDialogElement>(null);
@@ -44,6 +45,8 @@ export default function SettingsPage() {
       setInstances(s.instances);
       setUploadFilter(s.uploadFilter);
       setStackMode(s.stackMode);
+      setWriteSidecar(s.writeSidecar);
+      setWriteSidecar(s.writeSidecar);
       for (const url of s.instances) {
         hasApiKey(url)
           .then((has) => setKeyed((k) => ({ ...k, [url]: has })))
@@ -67,6 +70,11 @@ export default function SettingsPage() {
   async function updateStack(m: StackMode) {
     setStackMode(m);
     await saveSettings({ stackMode: m });
+  }
+
+  async function updateWriteSidecar(v: boolean) {
+    setWriteSidecar(v);
+    await saveSettings({ writeSidecar: v });
   }
 
   async function removeInstance(url: string) {
@@ -226,6 +234,22 @@ export default function SettingsPage() {
                 : "Only available when uploading both formats."}
             </span>
           </div>
+
+          <label className="flex cursor-pointer items-start gap-2">
+            <input
+              type="checkbox"
+              className="checkbox checkbox-sm mt-0.5"
+              checked={writeSidecar}
+              onChange={(e) => updateWriteSidecar(e.target.checked)}
+            />
+            <span className="flex flex-col">
+              <span className="label-text">Write sync data to cards (sd2i.data)</span>
+              <span className="label-text-alt opacity-70">
+                Adds a small file to each card so its sync status follows it between computers. You're
+                asked before the first write to any card.
+              </span>
+            </span>
+          </label>
         </div>
       </div>
 

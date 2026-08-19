@@ -4255,6 +4255,7 @@ version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "flate2",
  "futures-util",
  "hex",
  "image",
@@ -4274,6 +4275,7 @@ dependencies = [
  "tauri-plugin-store",
  "tokio",
  "tokio-util",
+ "uuid",
  "walkdir",
 ]
 

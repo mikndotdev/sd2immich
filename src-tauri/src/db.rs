@@ -12,7 +12,9 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use tauri::Manager;
 
-const SCHEMA_VERSION: i64 = 2;
+// v3 is non-destructive: identity now comes from the on-card `sd2i.data` sidecar (see cardfile.rs),
+// and legacy rows are migrated (re-keyed) into a card's new UUID on consent rather than wiped.
+const SCHEMA_VERSION: i64 = 3;
 
 /// Cached per-file state, enough to decide whether work can be skipped.
 #[derive(Clone, Debug)]
@@ -276,6 +278,32 @@ pub async fn load_card_cache(
     Ok(map)
 }
 
+/// Load all persisted rows for a card (full columns) — used to build a sidecar on demand.
+pub async fn load_card_files(pool: &SqlitePool, card_id: &str) -> Vec<FileRow> {
+    let rows = sqlx::query(
+        "SELECT rel_path, name, kind, base_key, size, mtime, checksum, immich_id, status, stacked, error FROM files WHERE card_id = ?1",
+    )
+    .bind(card_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows.into_iter()
+        .map(|r| FileRow {
+            rel_path: r.get("rel_path"),
+            name: r.get("name"),
+            kind: r.get("kind"),
+            base_key: r.get("base_key"),
+            size: r.get("size"),
+            mtime: r.get("mtime"),
+            checksum: r.get("checksum"),
+            immich_id: r.get("immich_id"),
+            status: r.get("status"),
+            stacked: r.get::<i64, _>("stacked") != 0,
+            error: r.get("error"),
+        })
+        .collect()
+}
+
 /// Upsert a batch of file rows in one transaction.
 pub async fn upsert_files(pool: &SqlitePool, card_id: &str, rows: &[FileRow]) -> Result<(), String> {
     let ts = now();
@@ -359,21 +387,61 @@ pub async fn clear_card(pool: &SqlitePool, card_id: &str) -> Result<(), String> 
     Ok(())
 }
 
-/// Resolve a source's identity plus its saved nickname (for the gallery header / clear-cache).
+/// Resolve a source's identity (sidecar UUID when present) plus its saved nickname.
 pub async fn resolve_card(pool: &SqlitePool, source: &Path) -> CardRef {
-    let card = card_identity(source);
-    let nickname = sqlx::query("SELECT nickname FROM cards WHERE card_id = ?1")
-        .bind(&card.id)
+    let ident = crate::cardfile::identify(source);
+    let nickname = match ident.name {
+        Some(n) => Some(n),
+        None => get_nickname(pool, &ident.card_id).await,
+    };
+    CardRef {
+        card_id: ident.card_id,
+        label: ident.label,
+        nickname,
+    }
+}
+
+pub async fn get_nickname(pool: &SqlitePool, card_id: &str) -> Option<String> {
+    sqlx::query("SELECT nickname FROM cards WHERE card_id = ?1")
+        .bind(card_id)
         .fetch_optional(pool)
         .await
         .ok()
         .flatten()
-        .and_then(|r| r.get::<Option<String>, _>("nickname"));
-    CardRef {
-        card_id: card.id,
-        label: card.label,
-        nickname,
+        .and_then(|r| r.get::<Option<String>, _>("nickname"))
+}
+
+pub async fn get_mount(pool: &SqlitePool, card_id: &str) -> Option<String> {
+    sqlx::query("SELECT mount_point FROM cards WHERE card_id = ?1")
+        .bind(card_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.get::<Option<String>, _>("mount_point"))
+}
+
+/// Move a card's rows from a provisional id to its minted UUID (legacy-data migration on first
+/// sidecar write). `new_id` is a fresh UUID, so no primary-key conflict.
+pub async fn rekey_card(pool: &SqlitePool, old_id: &str, new_id: &str) -> Result<(), String> {
+    if old_id == new_id {
+        return Ok(());
     }
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE files SET card_id = ?1 WHERE card_id = ?2")
+        .bind(new_id)
+        .bind(old_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE cards SET card_id = ?1 WHERE card_id = ?2")
+        .bind(new_id)
+        .bind(old_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Set (or clear, when `None`) a card's nickname.

@@ -3,9 +3,13 @@
 // One job at a time. On completion, notify + bounce the dock, but only when the window is unfocused.
 
 import { createContext, useCallback, useContext, useRef, useState, type ReactNode } from "react";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import {
+  loadSettings,
+  saveSettings,
+  sidecarStatus,
   startSync as invokeSync,
   verifyCard,
   type CardFile,
@@ -69,6 +73,31 @@ const IDLE_VERIFY: VerifyState = {
 
 const Ctx = createContext<JobsCtx | null>(null);
 
+/**
+ * Per-card consent for writing the sd2i.data sidecar. Returns whether the backend should write it.
+ * Prompts (native dialog) the first time a writable card lacks a sidecar; remembers a decline.
+ */
+async function resolveSidecarConsent(sourcePath: string): Promise<boolean> {
+  try {
+    const s = await loadSettings();
+    if (!s.writeSidecar) return false;
+    const status = await sidecarStatus(sourcePath);
+    if (status.hasSidecar) return true; // already present ⇒ already consented
+    if (!status.writable) return false; // read-only card
+    if (s.sidecarDeclined.includes(status.provisionalId)) return false;
+    const ok = await ask(
+      "sd2immich will add a small sd2i.data file to this card so its sync status follows the card between computers. Add it?",
+      { title: "Add file to card?", kind: "info" },
+    );
+    if (!ok) {
+      await saveSettings({ sidecarDeclined: [...s.sidecarDeclined, status.provisionalId] });
+    }
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 /** Fire a completion notification + one dock bounce — only if the window isn't focused. */
 async function notifyDone(title: string, body: string) {
   try {
@@ -91,9 +120,19 @@ export function JobsProvider({ children }: { children: ReactNode }) {
   const startSync = useCallback(async (config: StartSyncConfig, label?: string) => {
     if (busyRef.current) return null;
     busyRef.current = true;
+    const writeSidecar = await resolveSidecarConsent(config.sourcePath);
     setSync({ ...IDLE_SYNC, running: true, source: config.sourcePath, label: label ?? null });
     try {
-      const summary = await invokeSync(config, (p) => setSync((s) => ({ ...s, progress: p })));
+      const summary = await invokeSync(
+        { ...config, writeSidecar },
+        (p) => setSync((s) => ({ ...s, progress: p })),
+        (id, inImmich) =>
+          setVerify((v) =>
+            v.source === config.sourcePath
+              ? { ...v, cloud: { ...v.cloud, [id]: inImmich ? "in" : "out" } }
+              : v,
+          ),
+      );
       setSync((s) => ({ ...s, running: false, progress: null, summary }));
       notifyDone(
         "Sync complete",
@@ -112,9 +151,10 @@ export function JobsProvider({ children }: { children: ReactNode }) {
   const startVerify = useCallback(async (config: VerifyConfig) => {
     if (busyRef.current) return;
     busyRef.current = true;
+    const writeSidecar = await resolveSidecarConsent(config.sourcePath);
     setVerify({ ...IDLE_VERIFY, running: true, source: config.sourcePath });
     try {
-      const summary = await verifyCard(config, {
+      const summary = await verifyCard({ ...config, writeSidecar }, {
         onFiles: (fs) =>
           setVerify((v) => ({
             ...v,

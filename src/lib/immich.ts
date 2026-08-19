@@ -28,7 +28,25 @@ export type Settings = {
   deviceId: string;
   uploadFilter: UploadFilter;
   stackMode: StackMode;
+  /** master switch for writing the sd2i.data sidecar to cards */
+  writeSidecar: boolean;
+  /** provisional ids of cards the user declined the sidecar for (don't re-ask) */
+  sidecarDeclined: string[];
 };
+
+export type SidecarStatus = {
+  hasSidecar: boolean;
+  fileExists: boolean;
+  writable: boolean;
+  provisionalId: string;
+};
+
+export const sidecarStatus = (sourcePath: string) =>
+  invoke<SidecarStatus>("sidecar_status", { sourcePath });
+
+/** Write (or rewrite) the sd2i.data sidecar to a card on demand. */
+export const writeSidecarFile = (sourcePath: string, serverUrl: string) =>
+  invoke<void>("write_sidecar", { sourcePath, serverUrl });
 
 export type SyncProgress = {
   phase: "scan" | "hash" | "check" | "upload" | "stack" | "done";
@@ -48,7 +66,9 @@ export type Summary = {
   errorMessages: string[];
 };
 
-type SyncEvent = { event: "progress"; data: SyncProgress };
+type SyncEvent =
+  | { event: "progress"; data: SyncProgress }
+  | { event: "file"; data: { id: string; inImmich: boolean } };
 
 // ---- Settings store (non-secret values) ----
 
@@ -77,7 +97,9 @@ export async function loadSettings(): Promise<Settings> {
   }
   const uploadFilter = ((await s.get<string>("uploadFilter")) as UploadFilter) ?? "both";
   const stackMode = ((await s.get<string>("stackMode")) as StackMode) ?? "off";
-  return { serverUrl, instances, deviceId, uploadFilter, stackMode };
+  const writeSidecar = (await s.get<boolean>("writeSidecar")) ?? true;
+  const sidecarDeclined = (await s.get<string[]>("sidecarDeclined")) ?? [];
+  return { serverUrl, instances, deviceId, uploadFilter, stackMode, writeSidecar, sidecarDeclined };
 }
 
 export async function saveSettings(partial: Partial<Settings>): Promise<void> {
@@ -111,15 +133,18 @@ export type StartSyncConfig = {
   stackMode: StackMode;
   sourcePath: string;
   force?: boolean;
+  writeSidecar?: boolean;
 };
 
 export async function startSync(
   config: StartSyncConfig,
   onProgress: (p: SyncProgress) => void,
+  onFile?: (id: string, inImmich: boolean) => void,
 ): Promise<Summary> {
   const onEvent = new Channel<SyncEvent>();
   onEvent.onmessage = (msg) => {
     if (msg.event === "progress") onProgress(msg.data);
+    else if (msg.event === "file") onFile?.(msg.data.id, msg.data.inImmich);
   };
   return invoke<Summary>("start_sync", { config, onEvent });
 }
@@ -196,7 +221,13 @@ export type VerifyCallbacks = {
 };
 
 export async function verifyCard(
-  config: { serverUrl: string; sourcePath: string; uploadFilter: UploadFilter; force?: boolean },
+  config: {
+    serverUrl: string;
+    sourcePath: string;
+    uploadFilter: UploadFilter;
+    force?: boolean;
+    writeSidecar?: boolean;
+  },
   cb: VerifyCallbacks,
 ): Promise<VerifySummary> {
   const onEvent = new Channel<VerifyEventMsg>();

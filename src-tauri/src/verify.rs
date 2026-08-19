@@ -13,8 +13,9 @@ use sqlx::SqlitePool;
 use tauri::ipc::Channel;
 use tauri::State;
 
+use crate::cardfile;
 use crate::classify::{Classifier, UploadFilter};
-use crate::db::{self, FileRow};
+use crate::db::{self, CachedFile, FileRow};
 use crate::immich::{CheckItem, ImmichClient};
 use crate::keychain;
 
@@ -29,6 +30,9 @@ pub struct VerifyConfig {
     /// Bypass the local cache and re-hash/re-check everything.
     #[serde(default)]
     pub force: bool,
+    /// Write the `sd2i.data` sidecar to the card (consent resolved on the frontend).
+    #[serde(default)]
+    pub write_sidecar: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -91,15 +95,46 @@ pub async fn verify_card(
     let api_key = keychain::get_api_key(&config.server_url)?
         .ok_or_else(|| "No API key saved for this server — set it in Settings".to_string())?;
     let client = ImmichClient::new(&config.server_url, &api_key)?;
+
+    // Library id (Immich user id) — the "same server" key for portable card data.
+    let instance_id = client.me().await?.id;
+
     let media = client.media_types().await?;
     let classifier = Classifier::new(&media.image, &media.video);
 
-    let card = db::card_identity(&source);
-    db::touch_card(pool, &card).await?;
-    let cache = if config.force {
+    // Card identity: sidecar UUID when present, else a provisional volume-heuristic id.
+    let card_base = db::card_identity(&source);
+    let card_data = cardfile::read(&source);
+    let card_id = card_data
+        .as_ref()
+        .map(|d| d.card_id.clone())
+        .unwrap_or_else(|| card_base.id.clone());
+    let writable = cardfile::is_writable(&source);
+    db::touch_card(
+        pool,
+        &db::CardId {
+            id: card_id.clone(),
+            label: card_base.label.clone(),
+            mount_point: card_base.mount_point.clone(),
+            total_bytes: card_base.total_bytes,
+        },
+    )
+    .await?;
+    if let Some(name) = card_data.as_ref().and_then(|d| d.name.clone()) {
+        let _ = db::set_nickname(pool, &card_id, Some(name)).await;
+    }
+
+    let cache: HashMap<String, CachedFile> = if config.force {
         HashMap::new()
+    } else if let Some(inst) = card_data.as_ref().and_then(|d| d.instances.get(&instance_id)) {
+        let rows: Vec<FileRow> = inst.files.iter().map(|f| f.to_row()).collect();
+        let _ = db::upsert_files(pool, &card_id, &rows).await;
+        inst.files
+            .iter()
+            .map(|f| (f.rel_path.clone(), f.to_cached()))
+            .collect()
     } else {
-        db::load_card_cache(pool, &card.id).await.unwrap_or_default()
+        db::load_card_cache(pool, &card_id).await.unwrap_or_default()
     };
 
     let scan = crate::scan::scan_source(&source, &classifier, filter);
@@ -275,7 +310,31 @@ pub async fn verify_card(
             error: None,
         })
         .collect();
-    let _ = db::upsert_files(pool, &card.id, &rows).await;
+    let _ = db::upsert_files(pool, &card_id, &rows).await;
+
+    // ---- Write the on-card sidecar (consented + writable card) ----
+    if config.write_sidecar && writable {
+        let final_id = match card_data.as_ref() {
+            Some(d) => d.card_id.clone(),
+            None => {
+                let uuid = cardfile::new_card_id();
+                let _ = db::rekey_card(pool, &card_id, &uuid).await;
+                uuid
+            }
+        };
+        let mut data = card_data.unwrap_or_else(|| cardfile::CardData::new(final_id.clone()));
+        data.card_id = final_id.clone();
+        data.name = db::get_nickname(pool, &final_id).await.or(data.name);
+        data.instances.insert(
+            instance_id.clone(),
+            cardfile::InstanceData {
+                server_url: Some(config.server_url.clone()),
+                last_synced: cardfile::now_secs(),
+                files: rows.iter().map(cardfile::FileRecord::from_row).collect(),
+            },
+        );
+        let _ = cardfile::write(&source, &data);
+    }
 
     let _ = on_event.send(VerifyEvent::Progress {
         phase: "done".into(),

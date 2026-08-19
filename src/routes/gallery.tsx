@@ -43,6 +43,15 @@ const VERIFY_PHASE: Record<string, string> = {
   done: "Done",
 };
 
+const SYNC_PHASE: Record<string, string> = {
+  scan: "Scanning card",
+  hash: "Hashing files",
+  check: "Checking for duplicates",
+  upload: "Uploading",
+  stack: "Stacking RAW + JPEG",
+  done: "Finishing up",
+};
+
 type Mode = "library" | "card";
 
 export default function Gallery() {
@@ -287,7 +296,7 @@ function CardView({ settings }: { settings: Settings }) {
       sourcePath: source,
       force,
     });
-    verify(source); // refresh cloud state
+    // No re-verify needed — the grid's cloud icons update live as each file uploads.
   }
 
   async function clearCache() {
@@ -350,8 +359,9 @@ function CardView({ settings }: { settings: Settings }) {
     );
   }
 
-  const missing = v.summary?.missing ?? Object.values(v.cloud).filter((c) => c === "out").length;
-  const inImmich = v.summary?.inImmich ?? Object.values(v.cloud).filter((c) => c === "in").length;
+  // Derive counts from the live cloud map so they update as verify/sync stream in.
+  const missing = Object.values(v.cloud).filter((c) => c === "out").length;
+  const inImmich = Object.values(v.cloud).filter((c) => c === "in").length;
 
   // Sort (by file mtime) + filter (by sync state) the grid. "unsynced" = anything not yet
   // confirmed in Immich, so it shrinks as verify streams confirmations in.
@@ -458,6 +468,34 @@ function CardView({ settings }: { settings: Settings }) {
               className="progress progress-primary w-full"
               value={v.progress.done}
               max={v.progress.total}
+            />
+          ) : (
+            <progress className="progress progress-primary w-full" />
+          )}
+          <div className="mt-1 text-xs opacity-60">
+            {inImmich} in Immich · {missing} to upload
+          </div>
+        </div>
+      )}
+
+      {syncing && (
+        <div className="mb-3 rounded-lg bg-base-200 p-3">
+          <div className="mb-1 flex items-center justify-between text-sm">
+            <span className="flex items-center gap-2 font-medium">
+              <Loader2 size={14} className="animate-spin" />
+              {jobs.sync.progress ? (SYNC_PHASE[jobs.sync.progress.phase] ?? "Syncing") : "Starting…"}
+            </span>
+            {jobs.sync.progress && jobs.sync.progress.total > 0 && (
+              <span className="opacity-60">
+                {jobs.sync.progress.done} / {jobs.sync.progress.total}
+              </span>
+            )}
+          </div>
+          {jobs.sync.progress && jobs.sync.progress.total > 0 ? (
+            <progress
+              className="progress progress-primary w-full"
+              value={jobs.sync.progress.done}
+              max={jobs.sync.progress.total}
             />
           ) : (
             <progress className="progress progress-primary w-full" />
